@@ -1,36 +1,44 @@
 import os
-import asyncio
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from playwright.async_api import async_playwright
 import zipfile
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+import requests
+from bs4 import BeautifulSoup
+import pdfkit
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-@app.post("/generate")
-async def generate_pdfs(data: dict):
-    links = data.get("links", [])
-    os.makedirs("pdfs", exist_ok=True)
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        page = await browser.new_context()
-        
-        for i, link in enumerate(links[:10]): # Erstmal Test mit 10 Stück!
-            try:
-                new_page = await page.new_page()
-                await new_page.goto(link, timeout=60000)
-                await new_page.pdf(path=f"pdfs/seite_{i}.pdf")
-                await new_page.close()
-            except:
-                continue
-        
-        await browser.close()
+# Speicher für den Status
+jobs = {}
 
-    # Alles in eine ZIP packen
-    with zipfile.ZipFile("laws.zip", "w") as z:
-        for f in os.listdir("pdfs"):
-            z.write(f"pdfs/{f}", f)
-            
-    return {"download_url": "DEINE_URL/download"}
+@app.post("/analyze")
+async def analyze(data: dict):
+    url = data.get("url")
+    res = requests.get(url)
+    soup = BeautifulSoup(res.text, 'html.parser')
+    # Filtert die echten Gesetzes-Links
+    links = ["https://www.gesetze-im-internet.de" + a.get('href')[2:] for a in soup.find_all('a', href=True) if "BJNR" in a.get('href')]
+    return {"count": len(links), "links": links}
+
+@app.post("/generate")
+async def generate(data: dict, background_tasks: BackgroundTasks):
+    links = data.get("links", [])
+    os.makedirs("output", exist_ok=True)
+    
+    def create_pdfs():
+        with zipfile.ZipFile("webgrab-pdfs.zip", "w") as z:
+            for i, link in enumerate(links[:20]): # Test-Limit auf 20!
+                filename = f"output/gesetz_{i}.pdf"
+                try:
+                    pdfkit.from_url(link, filename)
+                    z.write(filename, os.path.basename(filename))
+                except: continue
+    
+    background_tasks.add_task(create_pdfs)
+    return {"message": "Generation started"}
+
+@app.get("/download")
+async def download():
+    return FileResponse("webgrab-pdfs.zip", media_type="application/zip", filename="webgrab-pdfs.zip")
