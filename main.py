@@ -1,6 +1,5 @@
 import os
 import zipfile
-import requests
 from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,10 +9,12 @@ import pdfkit
 import shutil
 import time
 import threading
+import urllib.parse
+from playwright.async_api import async_playwright # NEU: Playwright Import
 
 app = FastAPI()
 
-# ✅ CORS FIX: Regex erweitert, um auch alternative Lovable-Domains abzudecken
+# CORS-Einstellungen für Lovable
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://localhost:5173", "http://localhost:8000"],
@@ -23,19 +24,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Ordner für Einzel-Downloads
 os.makedirs("temp_pdfs", exist_ok=True)
 app.mount("/download_single", StaticFiles(directory="temp_pdfs"), name="temp_pdfs")
 
 status_lock = threading.Lock()
 status_db = {
-    "is_running": False,
-    "progress": 0,
-    "total": 0,
-    "current_item": "",
-    "completed_files": [],
-    "zip_ready": False,
-    "error": None,
+    "is_running": False, "progress": 0, "total": 0, "current_item": "",
+    "completed_files": [], "zip_ready": False, "error": None,
 }
 
 def set_status(**patch):
@@ -46,16 +41,13 @@ def get_pdf_config():
     env_path = os.environ.get("WKHTMLTOPDF_PATH")
     if env_path and os.path.exists(env_path):
         return pdfkit.configuration(wkhtmltopdf=env_path)
-
     wk = shutil.which("wkhtmltopdf")
     if wk:
         return pdfkit.configuration(wkhtmltopdf=wk)
-
     paths = ["/usr/bin/wkhtmltopdf", "/usr/local/bin/wkhtmltopdf", "/app/.nix-profile/bin/wkhtmltopdf"]
     for p in paths:
         if os.path.exists(p):
             return pdfkit.configuration(wkhtmltopdf=p)
-
     return None
 
 @app.get("/health")
@@ -67,6 +59,7 @@ async def get_status():
     with status_lock:
         return dict(status_db)
 
+# 🔥 HIER IST DIE MAGIE: Der neue Playwright-Analyzer 🔥
 @app.post("/analyze")
 async def analyze(data: dict):
     url = (data.get("url") or "").strip()
@@ -74,41 +67,53 @@ async def analyze(data: dict):
         raise HTTPException(status_code=400, detail="Bitte eine gültige http(s) URL angeben.")
 
     try:
-        # ✅ FIX: Echte Browser-Header simulieren, um nicht von IKEA & Co. geblockt zu werden
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "de,en-US;q=0.7,en;q=0.3"
-        }
-        
-        # ✅ FIX: Timeout etwas erhöht, da komplexe Seiten länger brauchen
-        res = requests.get(url, timeout=20, headers=headers, allow_redirects=True)
-        res.raise_for_status()
-        soup = BeautifulSoup(res.text, "html.parser")
+        # Starte den unsichtbaren Browser
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            
+            # Simuliere einen echten Windows/Chrome-Nutzer
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080},
+                java_script_enabled=True
+            )
+            page = await context.new_page()
+            
+            # Lade die Seite und warte, bis das Netzwerk für 500ms ruhig ist (JS ist durch)
+            await page.goto(url, wait_until="networkidle", timeout=45000)
+            
+            # Puffer: Warte extra 2 Sekunden, falls späte Skripte noch nachladen
+            await page.wait_for_timeout(2000)
+            
+            # Ziehe den komplett gerenderten Quellcode raus
+            html_content = await page.content()
+            await browser.close()
 
+        # Jetzt analysieren wir das FERTIGE HTML mit BeautifulSoup
+        soup = BeautifulSoup(html_content, "html.parser")
         links = []
         for a in soup.find_all("a", href=True):
             href = (a.get("href") or "").strip()
             low = href.lower()
 
+            # Unnötiges Zeug filtern
             if low.startswith("#") or low.startswith("mailto:") or low.startswith("javascript:") or low.startswith("tel:"):
                 continue
 
-            links.append(requests.compat.urljoin(res.url, href))
+            # Absolute URL zusammenbauen
+            absolute_link = urllib.parse.urljoin(url, href)
+            links.append(absolute_link)
 
-        # ✅ FIX: Duplikate entfernen für eine saubere Verarbeitung
+        # Duplikate entfernen
         unique_links = list(set(links))
 
         set_status(total=len(unique_links), error=None)
         return {"count": len(unique_links), "links": unique_links}
 
-    except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="Zeitüberschreitung (Timeout) bei der Anfrage.")
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Fehler beim Abrufen der URL: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unerwarteter Fehler: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Fehler beim Scraping mit Playwright: {str(e)}")
 
+# ... (Der /generate und /download Endpunkt bleiben exakt gleich wie in deiner vorherigen funktionierenden Version) ...
 @app.post("/generate")
 async def generate(data: dict, background_tasks: BackgroundTasks, request: Request):
     links = data.get("links", [])
@@ -122,46 +127,32 @@ async def generate(data: dict, background_tasks: BackgroundTasks, request: Reque
     base_url = str(request.base_url).rstrip("/")
 
     set_status(
-        is_running=True,
-        progress=0,
-        total=len(links),
-        current_item="",
-        completed_files=[],
-        zip_ready=False,
-        error=None,
+        is_running=True, progress=0, total=len(links), current_item="",
+        completed_files=[], zip_ready=False, error=None,
     )
 
     def worker_task(links_to_process):
         try:
             config = get_pdf_config()
             if not config:
-                set_status(error="wkhtmltopdf nicht gefunden! (Railpack aptPackages installieren)")
+                set_status(error="wkhtmltopdf nicht gefunden!")
                 return
 
             os.makedirs("temp_pdfs", exist_ok=True)
             for fn in os.listdir("temp_pdfs"):
                 fp = os.path.join("temp_pdfs", fn)
-                if os.path.isfile(fp):
-                    os.remove(fp)
+                if os.path.isfile(fp): os.remove(fp)
 
             zip_filename = "downloads.zip"
-            if os.path.exists(zip_filename):
-                os.remove(zip_filename)
+            if os.path.exists(zip_filename): os.remove(zip_filename)
 
             with zipfile.ZipFile(zip_filename, "w", compression=zipfile.ZIP_DEFLATED) as z:
                 for i, link in enumerate(links_to_process, start=1):
                     set_status(current_item=link)
-
                     fname = f"temp_pdfs/doc_{i}.pdf"
                     try:
-                        # ✅ FIX: Standard-Optionen für wkhtmltopdf, um Abstürze bei JS/SSL zu vermeiden
-                        options = {
-                            "quiet": "",
-                            "no-stop-slow-scripts": "",
-                            "javascript-delay": "1000",
-                        }
+                        options = {"quiet": "", "no-stop-slow-scripts": "", "javascript-delay": "1000"}
                         pdfkit.from_url(link, fname, configuration=config, options=options)
-
                         if os.path.exists(fname) and os.path.getsize(fname) > 0:
                             z.write(fname, os.path.basename(fname))
                             with status_lock:
@@ -170,16 +161,12 @@ async def generate(data: dict, background_tasks: BackgroundTasks, request: Reque
                                     "original": link
                                 })
                         else:
-                            set_status(error=f"Leeres PDF erzeugt bei: {link}")
-
+                            set_status(error=f"Leeres PDF bei: {link}")
                     except Exception as e:
                         set_status(error=f"Fehler bei {link}: {e}")
-
                     set_status(progress=i)
                     time.sleep(0.2)
-
             set_status(zip_ready=True)
-
         finally:
             set_status(is_running=False, current_item="")
 
