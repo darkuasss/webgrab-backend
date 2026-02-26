@@ -57,16 +57,32 @@ async def analyze(data: dict):
         return {"count": len(links), "links": links}
     except Exception as e:
         return {"error": str(e)}
-
 @app.post("/generate")
 async def generate(data: dict, background_tasks: BackgroundTasks):
     links = data.get("links", [])
-    # CRITICAL FIX: Status SOFORT auf True setzen
+    if not links:
+        return {"error": "No links provided"}
+    
+    # SOFORT-UPDATE: Damit Lovable nicht bei 0% hängen bleibt
     status_db["is_running"] = True
     status_db["progress"] = 0
     status_db["total"] = len(links)
     status_db["completed_files"] = []
     status_db["zip_ready"] = False
+    
+    def process_logic():
+        try:
+            # Hier kommt deine PDF-Logik rein...
+            # Wenn hier ein Fehler passiert, loggen wir ihn:
+            print("Worker gestartet...")
+            # ... (Rest des Codes)
+        except Exception as e:
+            print(f"FATALER FEHLER IM WORKER: {e}")
+        finally:
+            status_db["is_running"] = False
+
+    background_tasks.add_task(process_logic)
+    return {"status": "started"}
     
     def worker():
         try:
