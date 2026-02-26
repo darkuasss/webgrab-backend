@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 import pdfkit
 import shutil
 import time
+import shutil
 
 app = FastAPI()
 
@@ -24,7 +25,22 @@ app.add_middleware(
 # Statische Dateien für Einzel-Downloads freigeben
 os.makedirs("temp_pdfs", exist_ok=True)
 app.mount("/download_single", StaticFiles(directory="temp_pdfs"), name="temp_pdfs")
+# ... deine anderen Imports ...
 
+# AUTOMATISCHE PFAD-FINDER LOGIK
+# shutil.which sucht im gesamten System-PATH nach dem Programm
+wk_path = shutil.which("wkhtmltopdf")
+
+try:
+    if wk_path:
+        # Er hat ihn automatisch gefunden (egal ob /usr/bin oder /nix/store/...)
+        PDF_CONFIG = pdfkit.configuration(wkhtmltopdf=wk_path)
+    else:
+        # Letzter Versuch: Falls shutil versagt, lassen wir pdfkit suchen
+        PDF_CONFIG = pdfkit.configuration()
+except Exception as e:
+    print(f"Warnung: PDF-Drucker konnte nicht initialisiert werden: {e}")
+    PDF_CONFIG = None
 # PDF-PFAD FINDER (Verhindert den Absturz aus image_e9f3dd.png)
 def get_pdf_config():
     paths = ['/usr/bin/wkhtmltopdf', '/usr/local/bin/wkhtmltopdf']
