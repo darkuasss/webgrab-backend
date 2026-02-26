@@ -15,13 +15,21 @@ from playwright.async_api import async_playwright # NEU: Playwright Import
 app = FastAPI()
 
 # CORS-Einstellungen für Lovable
+from fastapi.middleware.cors import CORSMiddleware
+
+# ... (nach app = FastAPI())
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://localhost:8000"],
-    allow_origin_regex=r"^https://.*\.lovable\.(app|project\.com)$",
+    allow_origins=[
+        "http://localhost:5173", # Lokales Testing
+        "https://*.lovableproject.com", 
+        "https://*.lovable.app",
+        "*" # Der "Brecheisen"-Modus: Erlaubt JEDE Quelle
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"], # Erlaubt GET, POST, OPTIONS etc.
+    allow_headers=["*"], # Erlaubt alle Header (wichtig für Preflight!)
 )
 
 os.makedirs("temp_pdfs", exist_ok=True)
