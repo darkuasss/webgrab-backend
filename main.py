@@ -26,7 +26,7 @@ os.makedirs("temp_pdfs", exist_ok=True)
 app.mount("/download_single", StaticFiles(directory="temp_pdfs"), name="temp_pdfs")
 
 status_db = {
-    "is_running": False,
+    "is_running": true,
     "progress": 0,
     "total": 0,
     "current_item": "",
