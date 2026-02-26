@@ -1,15 +1,17 @@
 import os
-import zipfile
-import requests
-from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from bs4 import BeautifulSoup
-import pdfkit
-import shutil
+import re
 import time
+import zipfile
+import shutil
 import threading
+from urllib.parse import urljoin, urldefrag
+
+import requests
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
@@ -25,79 +27,212 @@ app.add_middleware(
 os.makedirs("temp_pdfs", exist_ok=True)
 app.mount("/download_single", StaticFiles(directory="temp_pdfs"), name="temp_pdfs")
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/pdf,*/*;q=0.8",
+    "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+DEFAULT_COOKIES = {
+    "consent": "true",
+    "cookies-accepted": "yes",
+    "allow-all": "true",
+}
+
 status_lock = threading.Lock()
 status_db = {
-    "is_running": False,   # ✅ Python bool
+    "is_running": False,
     "progress": 0,
     "total": 0,
     "current_item": "",
     "completed_files": [],
     "zip_ready": False,
     "error": None,
+    "pdf_found": 0,
 }
+
+ZIP_FILENAME = "downloads.zip"
+
 
 def set_status(**patch):
     with status_lock:
         status_db.update(patch)
 
-def get_pdf_config():
-    env_path = os.environ.get("WKHTMLTOPDF_PATH")
-    if env_path and os.path.exists(env_path):
-        return pdfkit.configuration(wkhtmltopdf=env_path)
 
-    wk = shutil.which("wkhtmltopdf")
-    if wk:
-        return pdfkit.configuration(wkhtmltopdf=wk)
+def normalize_url(u: str, base: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    u = urljoin(base, u)
+    u, _ = urldefrag(u)
+    return u
 
-    paths = ["/usr/bin/wkhtmltopdf", "/usr/local/bin/wkhtmltopdf", "/app/.nix-profile/bin/wkhtmltopdf"]
-    for p in paths:
-        if os.path.exists(p):
-            return pdfkit.configuration(wkhtmltopdf=p)
 
-    return None
+def looks_like_pdf_url(u: str) -> bool:
+    u_low = u.lower()
+    return (
+        u_low.endswith(".pdf") or
+        ".pdf?" in u_low or
+        "format=pdf" in u_low or
+        "type=pdf" in u_low or
+        "download=pdf" in u_low
+    )
+
+
+def is_pdf_by_probe(session: requests.Session, url: str, timeout: int = 15) -> tuple[bool, str, str]:
+    """
+    Returns: (is_pdf, final_url, reason)
+    Verifikation: HEAD -> Content-Type; falls unsicher -> GET stream -> check %PDF-
+    """
+    try:
+        # 1) HEAD
+        try:
+            r = session.head(url, headers=HEADERS, allow_redirects=True, timeout=timeout)
+            ct = (r.headers.get("Content-Type") or "").lower()
+            cd = (r.headers.get("Content-Disposition") or "").lower()
+
+            if "application/pdf" in ct:
+                return True, r.url, "head content-type=application/pdf"
+
+            # manche Server liefern octet-stream, aber disposition verrät PDF
+            if ("octet-stream" in ct or ct == "") and ("pdf" in cd or ".pdf" in cd):
+                return True, r.url, "head octet-stream + content-disposition hints pdf"
+        except Exception:
+            pass
+
+        # 2) GET probe (nur erste Bytes)
+        r2 = session.get(url, headers=HEADERS, allow_redirects=True, timeout=timeout, stream=True)
+        ct2 = (r2.headers.get("Content-Type") or "").lower()
+        if "application/pdf" in ct2:
+            return True, r2.url, "get content-type=application/pdf"
+
+        # read first bytes
+        chunk = next(r2.iter_content(chunk_size=16), b"")
+        if chunk.startswith(b"%PDF-"):
+            return True, r2.url, "get magic-bytes %PDF-"
+
+        return False, r2.url, f"not pdf (ct={ct2 or 'n/a'})"
+    except Exception as e:
+        return False, url, f"probe error: {e}"
+
+
+def extract_candidates(html: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    cand = set()
+
+    # a href
+    for a in soup.find_all("a", href=True):
+        u = normalize_url(a.get("href"), base_url)
+        if u:
+            cand.add(u)
+
+    # iframe/embed/object/link (pdf viewer embeds!)
+    for tag, attr in [("iframe", "src"), ("embed", "src"), ("object", "data"), ("link", "href")]:
+        for el in soup.find_all(tag):
+            v = el.get(attr)
+            u = normalize_url(v, base_url)
+            if u:
+                cand.add(u)
+
+    # onclick="window.open('...pdf')"
+    for el in soup.find_all(onclick=True):
+        txt = el.get("onclick") or ""
+        for m in re.findall(r"""['"]([^'"]+\.pdf[^'"]*)['"]""", txt, flags=re.IGNORECASE):
+            u = normalize_url(m, base_url)
+            if u:
+                cand.add(u)
+
+    # PDFs in Script-Text / Inline JSON
+    #  - absolute URLs
+    for m in re.findall(r"""https?://[^\s"'<>]+\.pdf(?:\?[^\s"'<>]*)?""", html, flags=re.IGNORECASE):
+        cand.add(normalize_url(m, base_url))
+    #  - relative URLs in quotes
+    for m in re.findall(r"""['"]([^'"]+\.pdf(?:\?[^'"]*)?)['"]""", html, flags=re.IGNORECASE):
+        u = normalize_url(m, base_url)
+        if u:
+            cand.add(u)
+
+    # Filter: nur http(s)
+    out = []
+    for u in cand:
+        if u.startswith("http://") or u.startswith("https://"):
+            out.append(u)
+
+    # Priorisiere "pdf-looking" URLs zuerst
+    out.sort(key=lambda x: 0 if looks_like_pdf_url(x) else 1)
+    return out
+
 
 @app.get("/status")
-async def get_status():
+def get_status():
     with status_lock:
         return dict(status_db)
 
+
 @app.post("/analyze")
-async def analyze(data: dict):
+def analyze(data: dict):
     url = (data.get("url") or "").strip()
-    if not url:
-        raise HTTPException(status_code=400, detail="No url provided")
+    if not url.startswith("http://") and not url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="Bitte eine http(s) URL angeben.")
 
-    try:
-        res = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        res.raise_for_status()
-        soup = BeautifulSoup(res.text, "html.parser")
+    timeout = int(data.get("timeout", 15))
+    max_checks = int(data.get("max_checks", 400))  # wie viele Kandidaten wirklich prüfen
 
-        links = []
-        for a in soup.find_all("a", href=True):
-            href = a.get("href") or ""
-            low = href.lower()
-            if any(x in low for x in ["#", "mailto:", "javascript:"]):
-                continue
-            links.append(requests.compat.urljoin(url, href))
+    session = requests.Session()
+    session.cookies.update(DEFAULT_COOKIES)
 
-        set_status(total=len(links))
-        return {"count": len(links), "links": links}
-    except Exception as e:
-        return {"error": str(e)}
+    # 1) Seite laden
+    res = session.get(url, headers={**HEADERS, "Referer": "https://www.google.com/"},
+                      timeout=timeout, allow_redirects=True)
+    res.raise_for_status()
+
+    # 2) Kandidaten extrahieren
+    candidates = extract_candidates(res.text, res.url)
+
+    # 3) Kandidaten als PDF verifizieren
+    pdfs = []
+    checked = 0
+
+    for u in candidates:
+        checked += 1
+        if checked > max_checks:
+            break
+
+        ok, final_url, _reason = is_pdf_by_probe(session, u, timeout=timeout)
+        if ok:
+            if final_url not in pdfs:
+                pdfs.append(final_url)
+
+    set_status(total=len(pdfs), pdf_found=len(pdfs))
+
+    # Lovable-kompatibel: count + links
+    return {
+        "count": len(pdfs),
+        "links": pdfs,
+        "checked_candidates": min(len(candidates), max_checks),
+        "total_candidates": len(candidates),
+        "base_page": res.url,
+    }
+
 
 @app.post("/generate")
-async def generate(data: dict, background_tasks: BackgroundTasks, request: Request):
+def generate(data: dict, background_tasks: BackgroundTasks, request: Request):
     links = data.get("links", [])
-    if not links:
+    if not isinstance(links, list) or not links:
         raise HTTPException(status_code=400, detail="No links provided")
 
-    # schon laufend?
-    with status_lock:
-        if status_db["is_running"]:
-            raise HTTPException(status_code=409, detail="Already running")
+    # nur http(s)
+    links = [x for x in links if isinstance(x, str) and (x.startswith("http://") or x.startswith("https://"))]
+    if not links:
+        raise HTTPException(status_code=400, detail="No valid http(s) links provided")
 
-    base_url = str(request.base_url).rstrip("/")  # ✅ dynamisch statt hardcoded
+    base_url = str(request.base_url).rstrip("/")
 
+    # Status reset
     set_status(
         is_running=True,
         progress=0,
@@ -108,54 +243,78 @@ async def generate(data: dict, background_tasks: BackgroundTasks, request: Reque
         error=None,
     )
 
-    def worker_task(links_to_process):
-        try:
-            config = get_pdf_config()
-            if not config:
-                set_status(error="wkhtmltopdf nicht gefunden! (Railway/Railpack apt packages installieren)")
-                return
+    def worker(pdf_urls: list[str]):
+        session = requests.Session()
+        session.cookies.update(DEFAULT_COOKIES)
 
-            # temp_pdfs NICHT löschen – nur leeren
+        try:
+            # temp_pdfs leeren (nicht löschen!)
+            os.makedirs("temp_pdfs", exist_ok=True)
             for fn in os.listdir("temp_pdfs"):
                 fp = os.path.join("temp_pdfs", fn)
                 if os.path.isfile(fp):
                     os.remove(fp)
 
-            zip_filename = "downloads.zip"
-            if os.path.exists(zip_filename):
-                os.remove(zip_filename)
+            if os.path.exists(ZIP_FILENAME):
+                os.remove(ZIP_FILENAME)
 
-            with zipfile.ZipFile(zip_filename, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                for i, link in enumerate(links_to_process, start=1):
-                    set_status(current_item=link)
+            with zipfile.ZipFile(ZIP_FILENAME, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                for i, pdf_url in enumerate(pdf_urls, start=1):
+                    set_status(current_item=pdf_url)
 
-                    fname = f"temp_pdfs/doc_{i}.pdf"
+                    # Nochmal verifizieren & final url holen
+                    ok, final_url, reason = is_pdf_by_probe(session, pdf_url, timeout=30)
+                    if not ok:
+                        set_status(error=f"Skip (kein PDF): {pdf_url} | {reason}")
+                        set_status(progress=i)
+                        continue
+
+                    filename = f"file_{i:04d}.pdf"
+                    out_path = os.path.join("temp_pdfs", filename)
+
                     try:
-                        pdfkit.from_url(link, fname, configuration=config, options={"quiet": ""})
-                        z.write(fname, os.path.basename(fname))
+                        r = session.get(final_url, headers=HEADERS, stream=True, timeout=60)
+                        r.raise_for_status()
+
+                        # Header-Check
+                        first = next(r.iter_content(chunk_size=16), b"")
+                        if not first.startswith(b"%PDF-"):
+                            # trotzdem speichern? nein -> skip
+                            set_status(error=f"Skip (kein %PDF- Header): {final_url}")
+                            set_status(progress=i)
+                            continue
+
+                        with open(out_path, "wb") as f:
+                            f.write(first)
+                            for chunk in r.iter_content(chunk_size=1024 * 64):
+                                if chunk:
+                                    f.write(chunk)
+
+                        z.write(out_path, arcname=filename)
 
                         with status_lock:
                             status_db["completed_files"].append({
-                                "url": f"{base_url}/download_single/doc_{i}.pdf",
-                                "original": link
+                                "url": f"{base_url}/download_single/{filename}",
+                                "original": final_url,
+                                "filename": filename,
                             })
+
                     except Exception as e:
-                        # weiter machen, aber Fehler merken
-                        set_status(error=f"Fehler bei {link}: {e}")
+                        set_status(error=f"Download error: {final_url} | {e}")
 
                     set_status(progress=i)
 
-            time.sleep(0.5)
             set_status(zip_ready=True)
 
         finally:
             set_status(is_running=False, current_item="")
 
-    background_tasks.add_task(worker_task, links)
+    background_tasks.add_task(worker, links)
     return {"status": "started"}
 
+
 @app.get("/download")
-async def download():
-    if os.path.exists("downloads.zip"):
-        return FileResponse("downloads.zip", filename="downloads.zip", media_type="application/zip")
+def download():
+    if os.path.exists(ZIP_FILENAME):
+        return FileResponse(ZIP_FILENAME, filename="downloads.zip", media_type="application/zip")
     return {"error": "Datei noch nicht erstellt"}
