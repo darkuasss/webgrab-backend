@@ -1,0 +1,7 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "buildAptPackages": ["wkhtmltopdf", "fontconfig", "fonts-dejavu-core"],
+  "deploy": {
+    "aptPackages": ["wkhtmltopdf", "fontconfig", "fonts-dejavu-core"]
+  }
+}
