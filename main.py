@@ -1,22 +1,18 @@
 import os
-import shutil
 import zipfile
-import threading
-import time
-from urllib.parse import urljoin, urldefrag, urlparse
-
 import requests
-from bs4 import BeautifulSoup
-import pdfkit
-
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-
+from fastapi.staticfiles import StaticFiles
+from bs4 import BeautifulSoup
+import pdfkit
+import shutil
+import time
+import threading
 
 app = FastAPI()
 
-# CORS (für Lovable o.ä.)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,230 +21,141 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-WORK_DIR = "work"
-PDF_DIR = os.path.join(WORK_DIR, "pdfs")
-ZIP_PATH = os.path.join(WORK_DIR, "downloads.zip")
-
-os.makedirs(PDF_DIR, exist_ok=True)
+# Ordner für Einzel-Downloads
+os.makedirs("temp_pdfs", exist_ok=True)
+app.mount("/download_single", StaticFiles(directory="temp_pdfs"), name="temp_pdfs")
 
 status_lock = threading.Lock()
 status_db = {
-    "is_running": False,
+    "is_running": False,   # ✅ Python bool
     "progress": 0,
     "total": 0,
     "current_item": "",
-    "completed_files": [],   # [{url, original, filename}]
+    "completed_files": [],
     "zip_ready": False,
     "error": None,
-    "base_url": "",
 }
-
 
 def set_status(**patch):
     with status_lock:
         status_db.update(patch)
 
-
 def get_pdf_config():
-    # 1) optional env
     env_path = os.environ.get("WKHTMLTOPDF_PATH")
     if env_path and os.path.exists(env_path):
         return pdfkit.configuration(wkhtmltopdf=env_path)
 
-    # 2) PATH
     wk = shutil.which("wkhtmltopdf")
     if wk:
         return pdfkit.configuration(wkhtmltopdf=wk)
 
-    # 3) bekannte Pfade
-    for p in ("/usr/bin/wkhtmltopdf", "/usr/local/bin/wkhtmltopdf", "/app/.nix-profile/bin/wkhtmltopdf"):
+    paths = ["/usr/bin/wkhtmltopdf", "/usr/local/bin/wkhtmltopdf", "/app/.nix-profile/bin/wkhtmltopdf"]
+    for p in paths:
         if os.path.exists(p):
             return pdfkit.configuration(wkhtmltopdf=p)
 
     return None
-
-
-def normalize_url(u: str) -> str:
-    u, _ = urldefrag(u)
-    return u.strip()
-
-
-def is_http(u: str) -> bool:
-    try:
-        return urlparse(u).scheme.lower() in ("http", "https")
-    except Exception:
-        return False
-
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
-
 
 @app.get("/status")
 async def get_status():
     with status_lock:
         return dict(status_db)
 
-
 @app.post("/analyze")
 async def analyze(data: dict):
     url = (data.get("url") or "").strip()
-    same_domain_only = bool(data.get("same_domain_only", True))
-    max_links = int(data.get("max_links", 300))
-
-    if not url or not is_http(url):
-        raise HTTPException(status_code=400, detail="Invalid url")
+    if not url:
+        raise HTTPException(status_code=400, detail="No url provided")
 
     try:
-        res = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        res = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         res.raise_for_status()
         soup = BeautifulSoup(res.text, "html.parser")
 
-        base_netloc = urlparse(url).netloc.lower()
         links = []
-        seen = set()
-
         for a in soup.find_all("a", href=True):
-            href = (a.get("href") or "").strip()
-            if not href:
-                continue
-
+            href = a.get("href") or ""
             low = href.lower()
-            if low.startswith("#") or low.startswith("mailto:") or low.startswith("javascript:") or low.startswith("tel:"):
+            if any(x in low for x in ["#", "mailto:", "javascript:"]):
                 continue
-
-            abs_url = normalize_url(urljoin(url, href))
-            if not is_http(abs_url):
-                continue
-
-            if same_domain_only and urlparse(abs_url).netloc.lower() != base_netloc:
-                continue
-
-            if abs_url in seen:
-                continue
-
-            seen.add(abs_url)
-            links.append(abs_url)
-
-            if len(links) >= max_links:
-                break
+            links.append(requests.compat.urljoin(url, href))
 
         set_status(total=len(links))
         return {"count": len(links), "links": links}
-
     except Exception as e:
         return {"error": str(e)}
 
-
 @app.post("/generate")
-async def generate(data: dict, request: Request):
+async def generate(data: dict, background_tasks: BackgroundTasks, request: Request):
     links = data.get("links", [])
-    if not isinstance(links, list) or not links:
+    if not links:
         raise HTTPException(status_code=400, detail="No links provided")
 
-    # nur gültige http(s)-links
-    clean_links = [normalize_url(x) for x in links if isinstance(x, str) and is_http(x)]
-    if not clean_links:
-        raise HTTPException(status_code=400, detail="No valid http(s) links provided")
-
+    # schon laufend?
     with status_lock:
         if status_db["is_running"]:
-            raise HTTPException(status_code=409, detail="Generation already running")
+            raise HTTPException(status_code=409, detail="Already running")
 
-    base_url = str(request.base_url)  # z.B. https://xyz.up.railway.app/
+    base_url = str(request.base_url).rstrip("/")  # ✅ dynamisch statt hardcoded
 
-    # Status reset
     set_status(
         is_running=True,
         progress=0,
-        total=len(clean_links),
+        total=len(links),
         current_item="",
         completed_files=[],
         zip_ready=False,
         error=None,
-        base_url=base_url,
     )
 
-    # Thread starten (damit /status Polling weiter funktioniert)
-    t = threading.Thread(target=worker_task, args=(clean_links,), daemon=True)
-    t.start()
+    def worker_task(links_to_process):
+        try:
+            config = get_pdf_config()
+            if not config:
+                set_status(error="wkhtmltopdf nicht gefunden! (Railway/Railpack apt packages installieren)")
+                return
 
-    return {"status": "started"}
+            # temp_pdfs NICHT löschen – nur leeren
+            for fn in os.listdir("temp_pdfs"):
+                fp = os.path.join("temp_pdfs", fn)
+                if os.path.isfile(fp):
+                    os.remove(fp)
 
+            zip_filename = "downloads.zip"
+            if os.path.exists(zip_filename):
+                os.remove(zip_filename)
 
-def worker_task(links_to_process: list[str]):
-    try:
-        config = get_pdf_config()
-        if not config:
-            set_status(
-                error="wkhtmltopdf not found. Install it via Railpack Apt packages (RAILPACK_DEPLOY_APT_PACKAGES).",
-                is_running=False,
-            )
-            return
+            with zipfile.ZipFile(zip_filename, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                for i, link in enumerate(links_to_process, start=1):
+                    set_status(current_item=link)
 
-        # Arbeitsordner frisch machen
-        if os.path.exists(WORK_DIR):
-            shutil.rmtree(WORK_DIR)
-        os.makedirs(PDF_DIR, exist_ok=True)
-
-        options = {
-            "quiet": "",
-            "print-media-type": "",
-        }
-
-        with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            for i, link in enumerate(links_to_process, start=1):
-                set_status(current_item=link)
-
-                filename = f"doc_{i:04d}.pdf"
-                pdf_path = os.path.join(PDF_DIR, filename)
-
-                try:
-                    pdfkit.from_url(link, pdf_path, configuration=config, options=options)
-
-                    if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
-                        z.write(pdf_path, arcname=filename)
+                    fname = f"temp_pdfs/doc_{i}.pdf"
+                    try:
+                        pdfkit.from_url(link, fname, configuration=config, options={"quiet": ""})
+                        z.write(fname, os.path.basename(fname))
 
                         with status_lock:
                             status_db["completed_files"].append({
-                                "url": f"{status_db['base_url']}download_single/{filename}",
-                                "original": link,
-                                "filename": filename,
+                                "url": f"{base_url}/download_single/doc_{i}.pdf",
+                                "original": link
                             })
-                    else:
-                        # leerer output
-                        pass
+                    except Exception as e:
+                        # weiter machen, aber Fehler merken
+                        set_status(error=f"Fehler bei {link}: {e}")
 
-                except Exception:
-                    # einzel-fehler ignorieren, weiter machen
-                    pass
+                    set_status(progress=i)
 
-                set_status(progress=i)
+            time.sleep(0.5)
+            set_status(zip_ready=True)
 
-        # ZIP ist da
-        set_status(zip_ready=True)
+        finally:
+            set_status(is_running=False, current_item="")
 
-    except Exception as e:
-        set_status(error=str(e))
-    finally:
-        set_status(is_running=False, current_item="")
-
+    background_tasks.add_task(worker_task, links)
+    return {"status": "started"}
 
 @app.get("/download")
 async def download():
-    if os.path.exists(ZIP_PATH):
-        return FileResponse(ZIP_PATH, filename="downloads.zip", media_type="application/zip")
+    if os.path.exists("downloads.zip"):
+        return FileResponse("downloads.zip", filename="downloads.zip", media_type="application/zip")
     return {"error": "Datei noch nicht erstellt"}
-
-
-@app.get("/download_single/{filename}")
-async def download_single(filename: str):
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only .pdf allowed")
-
-    path = os.path.join(PDF_DIR, filename)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    return FileResponse(path, filename=filename, media_type="application/pdf")
