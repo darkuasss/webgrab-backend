@@ -3,5 +3,8 @@
   "buildAptPackages": ["wkhtmltopdf", "fontconfig", "fonts-dejavu-core"],
   "deploy": {
     "aptPackages": ["wkhtmltopdf", "fontconfig", "fonts-dejavu-core"]
+  },
+  "build": {
+    "cmd": "python -m pip install -r requirements.txt && python -m playwright install chromium"
   }
 }
