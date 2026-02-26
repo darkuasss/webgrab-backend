@@ -1,61 +1,62 @@
 import os
 import zipfile
+import requests
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-import requests
 from bs4 import BeautifulSoup
 import pdfkit
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Speicher für den Status
-jobs = {}
+# DAS IST DER LIVE-STATUS
+status_db = {
+    "is_running": False,
+    "progress": 0,
+    "total": 0,
+    "current_item": "",
+    "completed_files": []
+}
 
 @app.post("/analyze")
 async def analyze(data: dict):
     url = data.get("url")
     res = requests.get(url)
     soup = BeautifulSoup(res.text, 'html.parser')
-    
-    links = []
-    # Die "Verbotene Liste" - diese Wörter ignorieren wir
-    blacklist = ["impressum", "datenschutz", "kontakt", "suche", "newsletter"]
-    
-    for a in soup.find_all('a', href=True):
-        href = a.get('href')
-        text = a.text.lower()
-        
-        # Check 1: Ist der Link in der Blacklist?
-        if any(word in href.lower() or word in text for word in blacklist):
-            continue
-            
-        # Check 2: Ist es eine PDF oder ein Unterlink (Gesetz/Verordnung)?
-        if href.endswith('.pdf') or "BJNR" in href or "Teilliste" in href or len(text) > 5:
-            full_url = requests.compat.urljoin(url, href)
-            links.append(full_url)
-    
-    # Entferne Duplikate
-    unique_links = list(set(links))
-    return {"count": len(unique_links), "links": unique_links}
+    links = [requests.compat.urljoin(url, a.get('href')) for a in soup.find_all('a', href=True) if not any(x in a.get('href') for x in ['#', 'mailto'])]
+    status_db["total"] = len(links)
+    status_db["completed_files"] = []
+    return {"count": len(links), "links": links}
+
 @app.post("/generate")
 async def generate(data: dict, background_tasks: BackgroundTasks):
     links = data.get("links", [])
-    os.makedirs("output", exist_ok=True)
+    status_db["is_running"] = True
+    status_db["progress"] = 0
     
-    def create_pdfs():
-        with zipfile.ZipFile("webgrab-pdfs.zip", "w") as z:
-            for i, link in enumerate(links[:20]): # Test-Limit auf 20!
-                filename = f"output/gesetz_{i}.pdf"
+    def bake_pdfs():
+        os.makedirs("temp_pdfs", exist_ok=True)
+        with zipfile.ZipFile("export.zip", "w") as z:
+            for i, link in enumerate(links):
+                status_db["current_item"] = link
+                fname = f"temp_pdfs/doc_{i}.pdf"
                 try:
-                    pdfkit.from_url(link, filename)
-                    z.write(filename, os.path.basename(filename))
-                except: continue
-    
-    background_tasks.add_task(create_pdfs)
-    return {"message": "Generation started"}
+                    # Hier wird die Webseite zum PDF gemacht
+                    pdfkit.from_url(link, fname)
+                    z.write(fname, os.path.basename(fname))
+                    status_db["completed_files"].append(link)
+                except: pass
+                status_db["progress"] = i + 1
+        status_db["is_running"] = False
+
+    background_tasks.add_task(bake_pdfs)
+    return {"status": "started"}
+
+@app.get("/status")
+async def get_status():
+    return status_db
 
 @app.get("/download")
 async def download():
-    return FileResponse("webgrab-pdfs.zip", media_type="application/zip", filename="webgrab-pdfs.zip")
+    return FileResponse("export.zip")
