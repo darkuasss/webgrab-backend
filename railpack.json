@@ -1,16 +1,12 @@
 {
   "$schema": "https://schema.railpack.com",
-  "buildAptPackages": ["wkhtmltopdf", "fontconfig", "fonts-dejavu-core"],
   "steps": {
     "install": {
       "commands": [
         "...",
-        { "cmd": "mkdir -p /app/pw-browsers", "customName": "Create Playwright browsers dir" },
-        { "cmd": "python -m playwright install --with-deps chromium", "customName": "Install Playwright Chromium" }
+        { "customName": "Create Playwright browsers dir", "cmd": "mkdir -p /app/pw-browsers" },
+        { "customName": "Install Playwright Chromium", "cmd": "python -m playwright install --with-deps chromium" }
       ]
     }
-  },
-  "deploy": {
-    "aptPackages": ["wkhtmltopdf", "fontconfig", "fonts-dejavu-core"]
   }
 }
