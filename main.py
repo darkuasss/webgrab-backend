@@ -13,16 +13,16 @@ import threading
 
 app = FastAPI()
 
-# ✅ CORS FIX: NICHT "*" mit credentials
-# Lovable Preview/Prod ist .lovable.app (wechselnde Subdomains) -> Regex
+# ✅ CORS FIX: Regex erweitert, um auch alternative Lovable-Domains abzudecken
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
-    allow_origin_regex=r"^https://.*\.lovable\.app$",
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://localhost:8000"],
+    allow_origin_regex=r"^https://.*\.lovable\.(app|project\.com)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # Ordner für Einzel-Downloads
 os.makedirs("temp_pdfs", exist_ok=True)
 app.mount("/download_single", StaticFiles(directory="temp_pdfs"), name="temp_pdfs")
@@ -71,10 +71,18 @@ async def get_status():
 async def analyze(data: dict):
     url = (data.get("url") or "").strip()
     if not url.startswith("http://") and not url.startswith("https://"):
-        raise HTTPException(status_code=400, detail="Bitte eine http(s) URL angeben.")
+        raise HTTPException(status_code=400, detail="Bitte eine gültige http(s) URL angeben.")
 
     try:
-        res = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
+        # ✅ FIX: Echte Browser-Header simulieren, um nicht von IKEA & Co. geblockt zu werden
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "de,en-US;q=0.7,en;q=0.3"
+        }
+        
+        # ✅ FIX: Timeout etwas erhöht, da komplexe Seiten länger brauchen
+        res = requests.get(url, timeout=20, headers=headers, allow_redirects=True)
         res.raise_for_status()
         soup = BeautifulSoup(res.text, "html.parser")
 
@@ -88,12 +96,18 @@ async def analyze(data: dict):
 
             links.append(requests.compat.urljoin(res.url, href))
 
-        set_status(total=len(links), error=None)
-        return {"count": len(links), "links": links}
+        # ✅ FIX: Duplikate entfernen für eine saubere Verarbeitung
+        unique_links = list(set(links))
 
+        set_status(total=len(unique_links), error=None)
+        return {"count": len(unique_links), "links": unique_links}
+
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Zeitüberschreitung (Timeout) bei der Anfrage.")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Fehler beim Abrufen der URL: {str(e)}")
     except Exception as e:
-        # ✅ Frontend bekommt sauberen HTTP Fehler (kein "blauer Screen" wegen undefined)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Unerwarteter Fehler: {str(e)}")
 
 @app.post("/generate")
 async def generate(data: dict, background_tasks: BackgroundTasks, request: Request):
@@ -101,7 +115,6 @@ async def generate(data: dict, background_tasks: BackgroundTasks, request: Reque
     if not isinstance(links, list) or not links:
         raise HTTPException(status_code=400, detail="No links provided")
 
-    # schon laufend?
     with status_lock:
         if status_db["is_running"]:
             raise HTTPException(status_code=409, detail="Already running")
@@ -125,7 +138,6 @@ async def generate(data: dict, background_tasks: BackgroundTasks, request: Reque
                 set_status(error="wkhtmltopdf nicht gefunden! (Railpack aptPackages installieren)")
                 return
 
-            # temp_pdfs NICHT löschen – nur leeren
             os.makedirs("temp_pdfs", exist_ok=True)
             for fn in os.listdir("temp_pdfs"):
                 fp = os.path.join("temp_pdfs", fn)
@@ -142,7 +154,13 @@ async def generate(data: dict, background_tasks: BackgroundTasks, request: Reque
 
                     fname = f"temp_pdfs/doc_{i}.pdf"
                     try:
-                        pdfkit.from_url(link, fname, configuration=config, options={"quiet": ""})
+                        # ✅ FIX: Standard-Optionen für wkhtmltopdf, um Abstürze bei JS/SSL zu vermeiden
+                        options = {
+                            "quiet": "",
+                            "no-stop-slow-scripts": "",
+                            "javascript-delay": "1000",
+                        }
+                        pdfkit.from_url(link, fname, configuration=config, options=options)
 
                         if os.path.exists(fname) and os.path.getsize(fname) > 0:
                             z.write(fname, os.path.basename(fname))
@@ -158,8 +176,8 @@ async def generate(data: dict, background_tasks: BackgroundTasks, request: Reque
                         set_status(error=f"Fehler bei {link}: {e}")
 
                     set_status(progress=i)
+                    time.sleep(0.2)
 
-            time.sleep(0.2)
             set_status(zip_ready=True)
 
         finally:
