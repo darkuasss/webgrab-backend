@@ -25,7 +25,7 @@ app.add_middleware(
 os.makedirs("temp_pdfs", exist_ok=True)
 app.mount("/download_single", StaticFiles(directory="temp_pdfs"), name="temp_pdfs")
 
-# FIX: Python verlangt zwingend großes 'True' und 'False'!
+# HIER WAR DER FEHLER: Alles sauber großgeschrieben (True/False)
 status_db = {
     "is_running": False,
     "progress": 0,
