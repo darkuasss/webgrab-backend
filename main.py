@@ -17,16 +17,12 @@ app = FastAPI()
 # Lovable Preview/Prod ist .lovable.app (wechselnde Subdomains) -> Regex
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-    ],
+    allow_origins=["http://localhost:3000", "http://localhost:5173"],
     allow_origin_regex=r"^https://.*\.lovable\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # Ordner für Einzel-Downloads
 os.makedirs("temp_pdfs", exist_ok=True)
 app.mount("/download_single", StaticFiles(directory="temp_pdfs"), name="temp_pdfs")
