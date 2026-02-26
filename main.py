@@ -18,10 +18,18 @@ async def analyze(data: dict):
     url = data.get("url")
     res = requests.get(url)
     soup = BeautifulSoup(res.text, 'html.parser')
-    # Filtert die echten Gesetzes-Links
-    links = ["https://www.gesetze-im-internet.de" + a.get('href')[2:] for a in soup.find_all('a', href=True) if "BJNR" in a.get('href')]
-    return {"count": len(links), "links": links}
-
+    
+    # Sucht jetzt nach ALLES, was auf .pdf endet ODER ein Gesetz sein könnte
+    links = []
+    for a in soup.find_all('a', href=True):
+        href = a.get('href')
+        # Wir nehmen PDF-Links ODER Links, die wie Gesetze aussehen
+        if href.endswith('.pdf') or "Teilliste" in href or "BJNR" in href:
+            # Baue die volle URL zusammen
+            full_url = requests.compat.urljoin(url, href)
+            links.append(full_url)
+    
+    return {"count": len(links), "links": list(set(links))} # set() entfernt Doppelte
 @app.post("/generate")
 async def generate(data: dict, background_tasks: BackgroundTasks):
     links = data.get("links", [])
