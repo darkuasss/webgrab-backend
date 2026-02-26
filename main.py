@@ -12,7 +12,7 @@ import time
 
 app = FastAPI()
 
-# CORS-Einstellungen für die Kommunikation mit Lovable
+# CORS-Einstellungen
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,12 +21,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Ordner für Einzel-Downloads bereitstellen
-os.makedirs("temp_pdfs", exist_ok="True")
+# Statische Dateien für Einzel-Downloads
+os.makedirs("temp_pdfs", exist_ok=True)
 app.mount("/download_single", StaticFiles(directory="temp_pdfs"), name="temp_pdfs")
 
+# FIX: Python verlangt zwingend großes 'True' und 'False'!
 status_db = {
-    "is_running": true,
+    "is_running": False,
     "progress": 0,
     "total": 0,
     "current_item": "",
@@ -35,7 +36,6 @@ status_db = {
 }
 
 def get_pdf_config():
-    # Sucht den PDF-Drucker an den typischen Railway-Pfaden
     paths = ['/usr/bin/wkhtmltopdf', '/usr/local/bin/wkhtmltopdf', '/app/.nix-profile/bin/wkhtmltopdf']
     for p in paths:
         if os.path.exists(p):
@@ -65,14 +65,13 @@ async def generate(data: dict, background_tasks: BackgroundTasks):
     if not links:
         return {"error": "No links provided"}
     
-    # Status sofort auf "läuft" setzen, damit Lovable das Polling startet
+    # Status sofort auf True setzen, damit Lovable das Polling startet
     status_db["is_running"] = True
     status_db["progress"] = 0
     status_db["total"] = len(links)
     status_db["completed_files"] = []
     status_db["zip_ready"] = False
     
-    # Die eigentliche Arbeits-Funktion (Worker)
     def worker_task(links_to_process):
         try:
             config = get_pdf_config()
@@ -80,7 +79,6 @@ async def generate(data: dict, background_tasks: BackgroundTasks):
                 print("FEHLER: wkhtmltopdf nicht gefunden!")
                 return
 
-            # Altes Zeug aufräumen
             if os.path.exists("temp_pdfs"):
                 shutil.rmtree("temp_pdfs")
             os.makedirs("temp_pdfs", exist_ok=True)
@@ -91,11 +89,9 @@ async def generate(data: dict, background_tasks: BackgroundTasks):
                     status_db["current_item"] = link
                     fname = f"temp_pdfs/doc_{i}.pdf"
                     try:
-                        # PDF generieren
                         pdfkit.from_url(link, fname, configuration=config)
                         z.write(fname, os.path.basename(fname))
                         
-                        # Link für Einzel-Download in der UI hinzufügen
                         status_db["completed_files"].append({
                             "url": f"https://web-production-a7d6d.up.railway.app/download_single/doc_{i}.pdf",
                             "original": link
@@ -113,14 +109,11 @@ async def generate(data: dict, background_tasks: BackgroundTasks):
         finally:
             status_db["is_running"] = False
 
-    # Task im Hintergrund starten
     background_tasks.add_task(worker_task, links)
-    
     return {"status": "started"}
 
 @app.get("/download")
 async def download():
-    # Schickt die fertige ZIP-Datei an den User
     if os.path.exists("downloads.zip"):
         return FileResponse("downloads.zip", filename="downloads.zip")
     return {"error": "Datei noch nicht erstellt"}
