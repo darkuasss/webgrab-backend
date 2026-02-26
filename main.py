@@ -22,7 +22,7 @@ app.add_middleware(
 )
 
 # Ordner für Einzel-Downloads bereitstellen
-os.makedirs("temp_pdfs", exist_ok=True)
+os.makedirs("temp_pdfs", exist_ok="True")
 app.mount("/download_single", StaticFiles(directory="temp_pdfs"), name="temp_pdfs")
 
 status_db = {
