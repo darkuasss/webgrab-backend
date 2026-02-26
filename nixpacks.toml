@@ -1,9 +1,9 @@
 [phases.setup]
-# Hier sagen wir Railway, dass wir den PDF-Drucker brauchen
+# Sagt Railway, dass wir den PDF-Drucker brauchen
 nixPkgs = ["wkhtmltopdf"]
 
 [phases.build]
-# Hier zwingen wir Railway, den Playwright-Browser und alle System-Abhängigkeiten zu installieren
+# Installiert die Python-Pakete UND den Playwright-Browser mit allen System-Abhängigkeiten
 cmds = [
     "pip install -r requirements.txt",
     "playwright install chromium --with-deps"
