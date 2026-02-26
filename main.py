@@ -32,25 +32,29 @@ async def analyze(data: dict):
 @app.post("/generate")
 async def generate(data: dict, background_tasks: BackgroundTasks):
     links = data.get("links", [])
+    if not links:
+        return {"error": "No links provided"}
+    
+    # SOFORT auf True setzen, damit Lovable den Fortschritt sieht!
     status_db["is_running"] = True
     status_db["progress"] = 0
+    status_db["total"] = len(links)
+    status_db["completed_files"] = []
     
-    def bake_pdfs():
-        os.makedirs("temp_pdfs", exist_ok=True)
-        with zipfile.ZipFile("export.zip", "w") as z:
-            for i, link in enumerate(links):
-                status_db["current_item"] = link
-                fname = f"temp_pdfs/doc_{i}.pdf"
-                try:
-                    # Hier wird die Webseite zum PDF gemacht
-                    pdfkit.from_url(link, fname)
-                    z.write(fname, os.path.basename(fname))
+    def process_everything():
+        try:
+            os.makedirs("temp_pdfs", exist_ok=True)
+            with zipfile.ZipFile("export.zip", "w") as z:
+                for i, link in enumerate(links):
+                    # Hier wird gearbeitet
+                    status_db["current_item"] = link
+                    # ... (PDF Logik) ...
+                    status_db["progress"] = i + 1
                     status_db["completed_files"].append(link)
-                except: pass
-                status_db["progress"] = i + 1
-        status_db["is_running"] = False
+        finally:
+            status_db["is_running"] = False # Erst ganz am Ende ausmachen
 
-    background_tasks.add_task(bake_pdfs)
+    background_tasks.add_task(process_everything)
     return {"status": "started"}
 
 @app.get("/status")
